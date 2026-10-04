@@ -57,3 +57,7 @@ measurements and exports stay on your machine.
 ## Requirements
 
 Python 3, numpy, matplotlib, olefile, openpyxl; `tkinterdnd2` is optional.
+
+## License
+
+[MIT](LICENSE)
