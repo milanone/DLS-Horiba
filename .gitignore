@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.claude/
+
+# Measurements and exports stay local
+*.nsz
+*.csv
+*.xlsx
