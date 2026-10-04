@@ -1,10 +1,15 @@
 """
 NSZ Viewer — Horiba SZ-100 DLS file browser & plotter
-Supporta drag & drop, confronto multiplo, esportazione CSV.
+Supporta drag & drop, confronto multiplo, esportazione Excel.
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os, struct, re, csv, io
+try:
+    import olefile
+    OLEFILE_AVAILABLE = True
+except ImportError:
+    OLEFILE_AVAILABLE = False
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -49,37 +54,46 @@ def parse_props(data):
                     v = struct.unpack('<f', data[j+1:j+5])[0]
                     if not (v != v):
                         props[key_b.decode('ascii')] = v
-                except: pass
+                except (struct.error, UnicodeDecodeError): pass
             i = j + 1
         else:
             i += 1
     return props
 
+def _open_ole(path):
+    if not OLEFILE_AVAILABLE:
+        raise ImportError("Libreria olefile non disponibile.\nInstallala con: pip install olefile")
+    return olefile.OleFileIO(path)
+
 def dump_nsz(path):
     """Stampa struttura interna del file .nsz per debug (time base, parametri correlatore)."""
-    import olefile
-    ole = olefile.OleFileIO(path)
-    def s(name):
-        return ole.openstream(name).read() if ole.exists(name) else b''
+    ole = _open_ole(path)
+    try:
+        def s(name):
+            return ole.openstream(name).read() if ole.exists(name) else b''
 
-    print(f"\n=== {os.path.basename(path)} ===")
-    print("Object3 header (primi 16 float32):")
-    hdr = f32(s('Object3'))[:16]
-    for i, v in enumerate(hdr):
-        print(f"  [{i:2d}] {v:.6g}")
+        print(f"\n=== {os.path.basename(path)} ===")
+        print("Object3 header (primi 16 float32):")
+        hdr = f32(s('Object3'))[:16]
+        for i, v in enumerate(hdr):
+            print(f"  [{i:2d}] {v:.6g}")
 
-    print("\nBase34 tutti i parametri float:")
-    p34 = parse_props(s('Base34'))
-    for k, v in sorted(p34.items()):
-        print(f"  {k} = {v:.6g}")
-
-    ole.close()
+        print("\nBase34 tutti i parametri float:")
+        p34 = parse_props(s('Base34'))
+        for k, v in sorted(p34.items()):
+            print(f"  {k} = {v:.6g}")
+    finally:
+        ole.close()
 
 def load_nsz(path):
     """Carica un file .nsz e restituisce un dict con tutti i dati."""
-    import olefile
-    ole = olefile.OleFileIO(path)
+    ole = _open_ole(path)
+    try:
+        return _read_nsz(path, ole)
+    finally:
+        ole.close()
 
+def _read_nsz(path, ole):
     def s(name):
         return ole.openstream(name).read() if ole.exists(name) else b''
 
@@ -157,8 +171,6 @@ def load_nsz(path):
         'AriMean_nm': pv(p1, 'CalcAriMean', 2.0),
     }
 
-    ole.close()
-
     return {
         'path': path,
         'name': os.path.splitext(os.path.basename(path))[0],
@@ -209,7 +221,7 @@ class NSZViewer:
             ("＋  Apri file .nsz", self._open_files),
             ("📁  Apri cartella",  self._open_folder),
             ("🗑  Rimuovi sel.",   self._remove_selected),
-            ("💾  Esporta Excel",  self._export_csv),
+            ("💾  Esporta Excel",  self._export_xlsx),
         ]:
             b = tk.Button(btn_frame, text=text, command=cmd,
                           bg="#334155", fg="white", relief=tk.FLAT,
@@ -550,11 +562,6 @@ class NSZViewer:
         self._plot_size()
         self._update_params_table()
 
-    def _refresh_all(self):
-        self._plot_acf()
-        self._plot_size()
-        self._update_params_table()
-
     def _plot_size(self):
         self.fig_size.clear()
 
@@ -819,7 +826,7 @@ class NSZViewer:
 
         wb.save(dest_path)
 
-    def _export_csv(self):
+    def _export_xlsx(self):
         if not self.selected:
             messagebox.showinfo("Esporta", "Nessun campione selezionato.")
             return
@@ -871,6 +878,11 @@ def main():
         print("Nota: tkinterdnd2 non disponibile, drag & drop disabilitato.")
 
     app = NSZViewer(root)
+
+    if not OLEFILE_AVAILABLE:
+        messagebox.showwarning("Dipendenza mancante",
+                               "Libreria olefile non disponibile: non sarà possibile aprire i file .nsz.\n"
+                               "Installala con: pip install olefile")
 
     # Se passati argomenti dalla riga di comando, carica quei file
     if len(sys.argv) > 1:

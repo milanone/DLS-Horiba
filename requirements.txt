@@ -1,0 +1,5 @@
+numpy
+matplotlib
+olefile
+openpyxl         # Excel export
+tkinterdnd2     # optional: drag-and-drop of files
