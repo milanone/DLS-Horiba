@@ -1,10 +1,11 @@
 """
 NSZ Viewer — Horiba SZ-100 DLS file browser & plotter
-Supporta drag & drop, confronto multiplo, esportazione Excel.
+Supports drag & drop, multiple-sample comparison, Excel export.
+The plots follow the shared Origin style of PlotStyleKit when the sibling repo is present.
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import os, struct, re, csv, io
+import os, struct, re, csv, io, pickle, traceback
 try:
     import olefile
     OLEFILE_AVAILABLE = True
@@ -30,11 +31,43 @@ try:
 except ImportError:
     DND_AVAILABLE = False
 
-# ── Palette colori per campioni multipli ──────────────────────────────────────
+
+def _load_origin_style():
+    """Load the shared Origin plot style (PlotStyleKit): a local copy first, then the sibling repo."""
+    import importlib.util as ilu
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, 'origin_style.py'),
+                 os.path.join(here, '..', 'PlotStyleKit', 'origin_style.py')):
+        if os.path.isfile(path):
+            spec = ilu.spec_from_file_location('origin_style', path)
+            mod = ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+
+try:
+    origin_style = _load_origin_style()
+    if origin_style is not None:
+        origin_style.applica_rcparams()
+except Exception:
+    origin_style = None
+
+# ── Colour palette for multiple samples (used only without PlotStyleKit) ─────
 COLORS = ["#2563EB","#DC2626","#16A34A","#D97706","#7C3AED",
           "#0891B2","#BE185D","#65A30D","#EA580C","#4338CA","#0D9488"]
+MAX_SAMPLES_SHOWN = len(COLORS)
 
-# ── Parser NSZ ────────────────────────────────────────────────────────────────
+
+def sample_colors():
+    """Colours for the overlaid samples: the Origin cycle (black first) if PlotStyleKit is loaded."""
+    if origin_style is not None:
+        cycle = matplotlib.rcParams['axes.prop_cycle'].by_key().get('color')
+        if cycle:
+            return list(cycle)
+    return COLORS
+
+# ── NSZ parser ────────────────────────────────────────────────────────────────
 
 def f32(data):
     n = len(data)//4
@@ -62,23 +95,23 @@ def parse_props(data):
 
 def _open_ole(path):
     if not OLEFILE_AVAILABLE:
-        raise ImportError("Libreria olefile non disponibile.\nInstallala con: pip install olefile")
+        raise ImportError("The olefile library is not available.\nInstall it with: pip install olefile")
     return olefile.OleFileIO(path)
 
 def dump_nsz(path):
-    """Stampa struttura interna del file .nsz per debug (time base, parametri correlatore)."""
+    """Print the internal structure of an .nsz file for debugging (time base, correlator parameters)."""
     ole = _open_ole(path)
     try:
         def s(name):
             return ole.openstream(name).read() if ole.exists(name) else b''
 
         print(f"\n=== {os.path.basename(path)} ===")
-        print("Object3 header (primi 16 float32):")
+        print("Object3 header (first 16 float32):")
         hdr = f32(s('Object3'))[:16]
         for i, v in enumerate(hdr):
             print(f"  [{i:2d}] {v:.6g}")
 
-        print("\nBase34 tutti i parametri float:")
+        print("\nBase34 all float parameters:")
         p34 = parse_props(s('Base34'))
         for k, v in sorted(p34.items()):
             print(f"  {k} = {v:.6g}")
@@ -86,7 +119,7 @@ def dump_nsz(path):
         ole.close()
 
 def load_nsz(path):
-    """Carica un file .nsz e restituisce un dict con tutti i dati."""
+    """Load an .nsz file and return a dict with all the data."""
     ole = _open_ole(path)
     try:
         return _read_nsz(path, ole)
@@ -97,7 +130,7 @@ def _read_nsz(path, ole):
     def s(name):
         return ole.openstream(name).read() if ole.exists(name) else b''
 
-    # ACF — tronca i canali baseline ripetuti alla fine (multi-tau correlator)
+    # ACF — trim the repeated baseline channels at the end (multi-tau correlator)
     tau_full = f32(s('Object3'))[16:]
     acf_full = f32(s('Object2'))[3:]
     cut = next((i for i in range(1, len(tau_full)) if tau_full[i] <= tau_full[i-1]),
@@ -105,22 +138,23 @@ def _read_nsz(path, ole):
     tau = tau_full[:cut]
     acf = acf_full[:cut]
 
-    # Fit e residui Horiba.
-    # Object10 header: [int=1][int=n_fit][int=fit_offset], poi i valori del fit.
-    # fit_offset = numero di canali iniziali (afterpulsing) esclusi dall'analisi.
+    # Horiba fit and residuals.
+    # Object10 header: [int=1][int=n_fit][int=fit_offset], then the fit values.
+    # fit_offset = number of initial channels (afterpulsing) excluded from the analysis.
     obj10_raw = f32(s('Object10'))
     FIT_OFFSET = struct.unpack('<I', struct.pack('<f', obj10_raw[2]))[0] if len(obj10_raw) > 2 else 6
     fit   = obj10_raw[3:]
     resid = f32(s('Object7'))[3:]
 
-    # Size distribution
-    sz    = f32(s('Object5'))[16:100]   # 84 nm bins
-    intens= f32(s('Object4'))[2:2+84]   # header=2 float32 (validato vs CSV software)
-    cumul = f32(s('Object31'))[2:2+84]
+    # Size distribution: 84 bins, with a different header length in each stream (17, 3 and 4 float32);
+    # validated against the CSV exported by the instrument software (all three match to its rounding)
+    sz    = f32(s('Object5'))[17:17+84]
+    intens= f32(s('Object4'))[3:3+84]
+    cumul = f32(s('Object31'))[4:4+84]
     nb    = min(len(sz), len(intens), len(cumul))
     sz, intens, cumul = sz[:nb], intens[:nb], cumul[:nb]
 
-    # Parametri
+    # Parameters
     p1  = parse_props(s('Base1'))
     p34 = parse_props(s('Base34'))
     d34 = s('Base34')
@@ -150,8 +184,8 @@ def _read_nsz(path, ole):
         'Temp_C':   pv(p34, 'MeasHolderTemp'),
         'Visc_mPas':pv(p34, 'MeasSolventVisco'),
         'n_solvent': pv(p34, 'MeasSolventRef'),
-        # I campi CalcMean/SD/Mode/PeakPos/D10/D50/D90 sono in RAGGIO → ×2
-        # PDI: CalcTotalPI è errato, usare Cum_fPi
+        # CalcMean/SD/Mode/PeakPos/D10/D50/D90 are stored as RADII → ×2
+        # PDI: CalcTotalPI is wrong, use Cum_fPi
         'Peak1_nm': pv(p1, 'CalcPeakPos[0]', 2.0),
         'Mean1_nm': pv(p1, 'CalcMean[0]',    2.0),
         'SD1_nm':   pv(p1, 'CalcSD[0]',      2.0),
@@ -165,7 +199,7 @@ def _read_nsz(path, ole):
         'Mode_nm':  pv(p1, 'CalcMode',   2.0),
         'Median_nm':pv(p1, 'CalcMedian', 2.0),
         'ZAvg_nm':  pv(p1, 'Cum_fMean',  2.0),
-        'PDI':      pv(p1, 'Cum_fPi'),          # Cum_fPi = PDI corretto
+        'PDI':      pv(p1, 'Cum_fPi'),          # Cum_fPi = the correct PDI
         'Span':     pv(p1, 'CalcSpan'),
         'GeoMean_nm': pv(p1, 'CalcGeoMean', 2.0),
         'AriMean_nm': pv(p1, 'CalcAriMean', 2.0),
@@ -185,7 +219,7 @@ def _read_nsz(path, ole):
         'params':     params,
     }
 
-# ── App principale ────────────────────────────────────────────────────────────
+# ── Main application ──────────────────────────────────────────────────────────
 
 class NSZViewer:
     def __init__(self, root):
@@ -196,14 +230,31 @@ class NSZViewer:
 
         self.samples = {}   # path → data dict
         self.selected = []  # list of paths currently shown
+        self._pe_module = None   # plot_editor module (PlotStyleKit), loaded on first use
 
+        self._build_menu()
         self._build_ui()
         self._setup_dnd()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
+    def _build_menu(self):
+        bar = tk.Menu(self.root)
+        m = tk.Menu(bar, tearoff=0)
+        m.add_command(label="Open .nsz files...", command=self._open_files)
+        m.add_command(label="Open folder...", command=self._open_folder)
+        m.add_command(label="Export Excel...", command=self._export_xlsx)
+        m.add_separator()
+        m.add_command(label="Save Figure Image (PNG, PDF, SVG)...", command=self.save_figure_image)
+        m.add_command(label="Save Figure (pickle)...", command=self.save_figure_pickle)
+        m.add_command(label="Edit Figure...", command=self.open_figure_editor)
+        m.add_separator()
+        m.add_command(label="Exit", command=self.root.destroy)
+        bar.add_cascade(label="File", menu=m)
+        self.root.config(menu=bar)
+
     def _build_ui(self):
-        # ── Sidebar sinistra ──────────────────────────────────────────────────
+        # ── Left sidebar ──────────────────────────────────────────────────────
         sidebar = tk.Frame(self.root, bg="#1E293B", width=260)
         sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=0, pady=0)
         sidebar.pack_propagate(False)
@@ -213,15 +264,15 @@ class NSZViewer:
         tk.Label(sidebar, text="Horiba SZ-100 DLS", font=("Helvetica", 9),
                  fg="#94A3B8", bg="#1E293B").pack(pady=(0,14))
 
-        # Pulsanti
+        # Buttons
         btn_frame = tk.Frame(sidebar, bg="#1E293B")
         btn_frame.pack(fill=tk.X, padx=10, pady=(0,10))
 
         for text, cmd in [
-            ("＋  Apri file .nsz", self._open_files),
-            ("📁  Apri cartella",  self._open_folder),
-            ("🗑  Rimuovi sel.",   self._remove_selected),
-            ("💾  Esporta Excel",  self._export_xlsx),
+            ("＋  Open .nsz files", self._open_files),
+            ("📁  Open folder",  self._open_folder),
+            ("🗑  Remove selected",   self._remove_selected),
+            ("💾  Export Excel",  self._export_xlsx),
         ]:
             b = tk.Button(btn_frame, text=text, command=cmd,
                           bg="#334155", fg="white", relief=tk.FLAT,
@@ -230,17 +281,17 @@ class NSZViewer:
                           activebackground="#475569", activeforeground="white")
             b.pack(fill=tk.X, pady=2)
 
-        # Zona drag & drop
+        # Drag & drop zone
         drop_lbl = tk.Label(sidebar,
-            text="⬇ Trascina qui i file .nsz",
+            text="⬇ Drop .nsz files here",
             font=("Helvetica", 9), fg="#64748B", bg="#1E293B",
             pady=10)
         drop_lbl.pack(fill=tk.X, padx=10)
 
         ttk.Separator(sidebar, orient="horizontal").pack(fill=tk.X, padx=10, pady=8)
 
-        # Lista campioni
-        tk.Label(sidebar, text="CAMPIONI CARICATI", font=("Helvetica", 8, "bold"),
+        # Sample list
+        tk.Label(sidebar, text="LOADED SAMPLES", font=("Helvetica", 8, "bold"),
                  fg="#64748B", bg="#1E293B").pack(anchor="w", padx=12)
 
         list_frame = tk.Frame(sidebar, bg="#1E293B")
@@ -251,7 +302,7 @@ class NSZViewer:
                                   selectbackground="#2563EB",
                                   font=("Helvetica", 9),
                                   borderwidth=0, highlightthickness=0,
-                                  activestyle="none")
+                                  activestyle="none", exportselection=False)
         scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
                                command=self.listbox.yview)
         self.listbox.config(yscrollcommand=scroll.set)
@@ -259,7 +310,7 @@ class NSZViewer:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
 
-        # ── Area principale ───────────────────────────────────────────────────
+        # ── Main area ─────────────────────────────────────────────────────────
         main = tk.Frame(self.root, bg="#F1F5F9")
         main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -277,15 +328,15 @@ class NSZViewer:
 
         # Tab 1: ACF
         self.tab_acf = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab_acf, text="  Autocorrelogramma  ")
+        self.notebook.add(self.tab_acf, text="  Autocorrelogram  ")
 
-        # Tab 2: Distribuzione dimensionale
+        # Tab 2: Size distribution
         self.tab_size = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab_size, text="  Distribuzione  ")
+        self.notebook.add(self.tab_size, text="  Distribution  ")
 
-        # Tab 3: Parametri
+        # Tab 3: Parameters
         self.tab_params = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab_params, text="  Parametri  ")
+        self.notebook.add(self.tab_params, text="  Parameters  ")
 
         self._build_acf_tab()
         self._build_size_tab()
@@ -295,20 +346,20 @@ class NSZViewer:
         ctrl = tk.Frame(self.tab_acf, bg="white", pady=4)
         ctrl.pack(fill=tk.X, padx=14)
 
-        tk.Label(ctrl, text="Scala X:", bg="white", font=("Helvetica",9)).pack(side=tk.LEFT)
+        tk.Label(ctrl, text="X scale:", bg="white", font=("Helvetica",9)).pack(side=tk.LEFT)
         self.acf_xscale = tk.StringVar(value="log")
-        for val, lbl in [("log","Log"),("linear","Lineare")]:
+        for val, lbl in [("log","Log"),("linear","Linear")]:
             tk.Radiobutton(ctrl, text=lbl, variable=self.acf_xscale, value=val,
                            bg="white", font=("Helvetica",9),
                            command=self._plot_acf).pack(side=tk.LEFT, padx=4)
 
         self.show_fit = tk.BooleanVar(value=True)
-        tk.Checkbutton(ctrl, text="Mostra fit ideale", variable=self.show_fit,
+        tk.Checkbutton(ctrl, text="Show ideal fit", variable=self.show_fit,
                        bg="white", font=("Helvetica",9),
                        command=self._plot_acf).pack(side=tk.LEFT, padx=12)
 
         self.show_resid = tk.BooleanVar(value=False)
-        tk.Checkbutton(ctrl, text="Mostra residui", variable=self.show_resid,
+        tk.Checkbutton(ctrl, text="Show residuals", variable=self.show_resid,
                        bg="white", font=("Helvetica",9),
                        command=self._plot_acf).pack(side=tk.LEFT, padx=4)
 
@@ -321,24 +372,24 @@ class NSZViewer:
         ctrl = tk.Frame(self.tab_size, bg="white", pady=4)
         ctrl.pack(fill=tk.X, padx=14)
 
-        tk.Label(ctrl, text="Scala X:", bg="white", font=("Helvetica",9)).pack(side=tk.LEFT)
+        tk.Label(ctrl, text="X scale:", bg="white", font=("Helvetica",9)).pack(side=tk.LEFT)
         self.size_xscale = tk.StringVar(value="log")
-        for val, lbl in [("log","Log"),("linear","Lineare")]:
+        for val, lbl in [("log","Log"),("linear","Linear")]:
             tk.Radiobutton(ctrl, text=lbl, variable=self.size_xscale, value=val,
                            bg="white", font=("Helvetica",9),
                            command=self._plot_size).pack(side=tk.LEFT, padx=4)
 
         ttk.Separator(ctrl, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
-        tk.Label(ctrl, text="Rappresentazione:", bg="white", font=("Helvetica",9)).pack(side=tk.LEFT)
+        tk.Label(ctrl, text="Representation:", bg="white", font=("Helvetica",9)).pack(side=tk.LEFT)
         self.size_repr = tk.StringVar(value="intensity")
-        for val, lbl in [("intensity","Intensità"),("number","Numero")]:
+        for val, lbl in [("intensity","Intensity"),("number","Number")]:
             tk.Radiobutton(ctrl, text=lbl, variable=self.size_repr, value=val,
                            bg="white", font=("Helvetica",9),
                            command=self._plot_size).pack(side=tk.LEFT, padx=4)
 
         ttk.Separator(ctrl, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
         self.show_cumul = tk.BooleanVar(value=True)
-        tk.Checkbutton(ctrl, text="Mostra cumulativa", variable=self.show_cumul,
+        tk.Checkbutton(ctrl, text="Show cumulative", variable=self.show_cumul,
                        bg="white", font=("Helvetica",9),
                        command=self._plot_size).pack(side=tk.LEFT, padx=4)
 
@@ -351,17 +402,17 @@ class NSZViewer:
         frame = tk.Frame(self.tab_params, bg="white")
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        cols = ("Parametro",
-                "Campione 1","Campione 2","Campione 3",
-                "Campione 4","Campione 5")
+        cols = ("Parameter",
+                "Sample 1","Sample 2","Sample 3",
+                "Sample 4","Sample 5")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings",
                                  selectmode="browse")
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        self.tree.heading("Parametro", text="Parametro")
-        self.tree.column("Parametro", width=160, anchor="w")
+        self.tree.heading("Parameter", text="Parameter")
+        self.tree.column("Parameter", width=160, anchor="w")
         for c in cols[1:]:
             self.tree.heading(c, text=c)
             self.tree.column(c, width=180, anchor="center")
@@ -377,7 +428,7 @@ class NSZViewer:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Alternanza righe
+        # Alternating rows
         self.tree.tag_configure("odd",  background="#F8FAFC")
         self.tree.tag_configure("even", background="white")
 
@@ -387,12 +438,12 @@ class NSZViewer:
         if DND_AVAILABLE:
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind('<<Drop>>', self._on_drop)
-        # fallback: click sulla label
+        # fallback: right click on the list opens the file dialog
         self.listbox.bind("<Button-3>", lambda e: self._open_files())
 
     def _on_drop(self, event):
         raw = event.data
-        # tkinterdnd2 restituisce percorsi separati da spazi, con {} per quelli con spazi
+        # tkinterdnd2 returns space-separated paths, with {} around those containing spaces
         paths = self.root.tk.splitlist(raw)
         nsz_files = []
         for p in paths:
@@ -408,12 +459,12 @@ class NSZViewer:
 
     def _open_files(self):
         files = filedialog.askopenfilenames(
-            title="Apri file NSZ",
-            filetypes=[("Horiba NSZ", "*.nsz"), ("Tutti i file", "*.*")])
+            title="Open NSZ files",
+            filetypes=[("Horiba NSZ", "*.nsz"), ("All Files", "*.*")])
         self._load_files(files)
 
     def _open_folder(self):
-        folder = filedialog.askdirectory(title="Apri cartella con file NSZ")
+        folder = filedialog.askdirectory(title="Open folder with NSZ files")
         if folder:
             files = [os.path.join(folder, f)
                      for f in sorted(os.listdir(folder))
@@ -437,10 +488,10 @@ class NSZViewer:
                 errors.append(f"{os.path.basename(path)}: {e}")
 
         if errors:
-            messagebox.showerror("Errore caricamento",
+            messagebox.showerror("Loading error",
                                  "\n".join(errors[:5]))
         if new:
-            # Seleziona automaticamente i nuovi
+            # Automatically select the new ones
             n = self.listbox.size()
             self.listbox.selection_clear(0, tk.END)
             for i in range(n - new, n):
@@ -457,7 +508,7 @@ class NSZViewer:
         self.selected = []
         self._refresh_all()
 
-    # ── Selezione ─────────────────────────────────────────────────────────────
+    # ── Selection ─────────────────────────────────────────────────────────────
 
     def _on_select(self, event=None):
         indices = self.listbox.curselection()
@@ -470,7 +521,30 @@ class NSZViewer:
         self._plot_size()
         self._update_params_table()
 
-    # ── Plot ACF ──────────────────────────────────────────────────────────────
+    # ── Plot style (PlotStyleKit) ─────────────────────────────────────────────
+
+    def _style_figure(self, fig):
+        """Apply the shared Origin style to every axes of `fig`, then enlarge the fonts for the on-screen
+        pane (the 8-9 pt paper sizes look tiny when the plot fills the tab) and lay the figure out."""
+        if origin_style is None:
+            for ax in fig.axes:
+                ax.grid(True, which='both', alpha=0.3, linestyle='--')
+            fig.tight_layout()
+            return
+        for ax in fig.axes:
+            origin_style.applica_stile_origin(ax, None, set_size=False)
+            ax.title.set_fontsize(11)
+            ax.xaxis.label.set_fontsize(10)
+            ax.yaxis.label.set_fontsize(10)
+            ax.tick_params(axis='both', labelsize=9)
+            leg = ax.get_legend()
+            if leg is not None:
+                for t in leg.get_texts():
+                    t.set_fontsize(9)
+        fig._editor_font_family = origin_style.font_origin()
+        fig.tight_layout()
+
+    # ── ACF plot ──────────────────────────────────────────────────────────────
 
     def _plot_acf(self):
         self.fig_acf.clear()
@@ -484,16 +558,17 @@ class NSZViewer:
             axr = None
 
         xscale = self.acf_xscale.get()
+        palette = sample_colors()
 
-        for idx, path in enumerate(self.selected[:len(COLORS)]):
+        for idx, path in enumerate(self.selected[:MAX_SAMPLES_SHOWN]):
             d = self.samples[path]
-            c = COLORS[idx % len(COLORS)]
+            c = palette[idx % len(palette)]
             lbl = self._short_label(d['name'])
 
             tau = d['tau']
             acf = d['acf']
 
-            # Filtra valori sensati
+            # Keep sensible values only
             mask = (tau > 0) & (acf >= -0.05) & (acf <= 1.05)
             if mask.sum() < 2:
                 continue
@@ -501,7 +576,7 @@ class NSZViewer:
             ax.plot(tau[mask], acf[mask], 'o', color=c, markersize=3.5,
                     linewidth=0, label=lbl)
 
-            # Fit ideale — allineato a tau[fit_offset:]
+            # Ideal fit — aligned to tau[fit_offset:]
             off = d.get('fit_offset', 6)
             if self.show_fit.get() and len(d['fit']) > 2:
                 tau_fit = tau[off:off + len(d['fit'])]
@@ -509,7 +584,7 @@ class NSZViewer:
                 ax.plot(tau_fit, fit_vals, '-', color=c, linewidth=1.5,
                         alpha=0.85)
 
-            # Residui — stesso offset del fit
+            # Residuals — same offset as the fit
             if axr is not None and len(d['resid']) > 2:
                 tau_res = tau[off:off + len(d['resid'])]
                 res_vals = d['resid'][:len(tau_res)]
@@ -517,37 +592,36 @@ class NSZViewer:
                          linewidth=1, alpha=0.8)
 
         ax.set_xscale(xscale)
-        ax.set_xlabel("Tempo di ritardo τ (µs)", fontsize=10)
-        ax.set_ylabel("g₁(τ) normalizzata", fontsize=10)
+        ax.set_xlabel("Delay time τ (µs)", fontsize=10)
+        # mathtext because Arial has no subscript glyphs; the stream holds g1 squared (see CLAUDE.md)
+        ax.set_ylabel(r"$g_2(\tau) - 1$ normalized", fontsize=10)
         ax.set_ylim(-0.05, 1.1)
-        ax.set_title("Funzione di autocorrelazione (ACF)", fontsize=11, fontweight='bold')
-        ax.grid(True, which='both', alpha=0.3, linestyle='--')
+        ax.set_title("Autocorrelation function (ACF)", fontsize=11, fontweight='bold')
         ax.axhline(0, color='gray', linewidth=0.7, linestyle='--')
         if self.selected:
             ax.legend(fontsize=8, loc='upper right', framealpha=0.9)
 
         if axr is not None:
             axr.set_xscale(xscale)
-            axr.set_xlabel("Tempo di ritardo τ (µs)", fontsize=10)
-            axr.set_ylabel("Residui", fontsize=9)
+            axr.set_xlabel("Delay time τ (µs)", fontsize=10)
+            axr.set_ylabel("Residuals", fontsize=9)
             axr.axhline(0, color='gray', linewidth=0.8)
-            axr.grid(True, which='both', alpha=0.3, linestyle='--')
             plt.setp(ax.get_xticklabels(), visible=False)
             ax.set_xlabel("")
 
         if not self.selected:
-            ax.text(0.5, 0.5, "Nessun campione selezionato\n\nCarica file .nsz e selezionali dalla lista",
+            ax.text(0.5, 0.5, "No sample selected\n\nLoad .nsz files and select them in the list",
                     ha='center', va='center', transform=ax.transAxes,
                     fontsize=12, color='#94A3B8')
 
-        self.fig_acf.tight_layout()
+        self._style_figure(self.fig_acf)
         self.canvas_acf.draw()
 
-    # ── Plot distribuzione ────────────────────────────────────────────────────
+    # ── Distribution plot ─────────────────────────────────────────────────────
 
     @staticmethod
     def _to_number_dist(sz, intens):
-        """Converti distribuzione in intensità → numero (approssimazione Rayleigh: N ∝ I/d⁶)."""
+        """Convert an intensity distribution to a number distribution (Rayleigh approximation: N ∝ I/d⁶)."""
         d6 = np.where(sz > 0, sz ** 6, np.nan)
         num = np.where(sz > 0, intens / d6, 0.0)
         total = num.sum()
@@ -576,10 +650,11 @@ class NSZViewer:
             axc = None
 
         xscale = self.size_xscale.get()
+        palette = sample_colors()
 
-        for idx, path in enumerate(self.selected[:len(COLORS)]):
+        for idx, path in enumerate(self.selected[:MAX_SAMPLES_SHOWN]):
             d = self.samples[path]
-            c = COLORS[idx % len(COLORS)]
+            c = palette[idx % len(palette)]
             lbl = self._short_label(d['name'])
 
             sz    = d['sz']
@@ -612,37 +687,38 @@ class NSZViewer:
                             axc.axvline(val, color=c, linewidth=0.7,
                                         linestyle='--', alpha=0.6)
 
-        repr_lbl = "numero" if by_number else "intensità"
+        repr_lbl = "number" if by_number else "intensity"
+        ax.margins(y=0.18)                  # headroom so the legend does not cover the top of the peak
+        top = ax.get_ylim()[1]
+        ax.set_ylim(-0.02 * top, top)       # distributions are >= 0: no empty space below the baseline
         ax.set_xscale(xscale)
-        ax.set_xlabel("Diametro (nm)", fontsize=10)
-        ax.set_ylabel(f"{'Numero' if by_number else 'Intensità'} (%)", fontsize=10)
-        ax.set_title(f"Distribuzione dimensionale in {repr_lbl}", fontsize=11, fontweight='bold')
-        ax.grid(True, which='both', alpha=0.3, linestyle='--')
+        ax.set_xlabel("Diameter (nm)", fontsize=10)
+        ax.set_ylabel(f"{'Number' if by_number else 'Intensity'} (%)", fontsize=10)
+        ax.set_title(f"Size distribution by {repr_lbl}", fontsize=11, fontweight='bold')
         if self.selected:
             ax.legend(fontsize=8, loc='upper right', framealpha=0.9)
 
         if axc is not None:
             axc.set_xscale(xscale)
-            axc.set_xlabel("Diametro (nm)", fontsize=10)
-            axc.set_ylabel("Cumulativa (%)", fontsize=10)
-            axc.set_title(f"Distribuzione cumulativa in {repr_lbl}", fontsize=11, fontweight='bold')
+            axc.set_xlabel("Diameter (nm)", fontsize=10)
+            axc.set_ylabel("Cumulative (%)", fontsize=10)
+            axc.set_title(f"Cumulative distribution by {repr_lbl}", fontsize=11, fontweight='bold')
             axc.set_ylim(-2, 104)
             axc.axhline(10, color='gray', linewidth=0.5, linestyle=':')
             axc.axhline(50, color='gray', linewidth=0.5, linestyle=':')
             axc.axhline(90, color='gray', linewidth=0.5, linestyle=':')
-            axc.grid(True, which='both', alpha=0.3, linestyle='--')
             if self.selected:
                 axc.legend(fontsize=8, loc='upper left', framealpha=0.9)
 
         if not self.selected:
-            ax.text(0.5, 0.5, "Nessun campione selezionato\n\nCarica file .nsz e selezionali dalla lista",
+            ax.text(0.5, 0.5, "No sample selected\n\nLoad .nsz files and select them in the list",
                     ha='center', va='center', transform=ax.transAxes,
                     fontsize=12, color='#94A3B8')
 
-        self.fig_size.tight_layout()
+        self._style_figure(self.fig_size)
         self.canvas_size.draw()
 
-    # ── Tabella parametri ─────────────────────────────────────────────────────
+    # ── Parameters table ──────────────────────────────────────────────────────
 
     def _update_params_table(self):
         self.tree.delete(*self.tree.get_children())
@@ -650,22 +726,22 @@ class NSZViewer:
         if not sel:
             return
 
-        # Aggiorna intestazioni colonne
+        # Update the column headings
         for i, path in enumerate(sel):
             n = self.samples[path]['params'].get('Sample_Name','')
             lbl = n
-            self.tree.heading(f"Campione {i+1}", text=lbl)
+            self.tree.heading(f"Sample {i+1}", text=lbl)
 
         ROWS = [
-            ("── Misurazione ──", None),
-            ("Data / Ora", lambda p: f"{p.get('Date','')} {p.get('Time','')}"),
-            ("Angolo (°)", lambda p: p.get('Angle_deg')),
-            ("Lunghezza d'onda (nm)", lambda p: p.get('Lambda_nm')),
-            ("Temperatura (°C)", lambda p: p.get('Temp_C')),
-            ("Viscosità (mPas)", lambda p: p.get('Visc_mPas')),
-            ("n solvente", lambda p: p.get('n_solvent')),
-            ("Solvente", lambda p: p.get('Solvent')),
-            ("── Risultati ──", None),
+            ("── Measurement ──", None),
+            ("Date / Time", lambda p: f"{p.get('Date','')} {p.get('Time','')}"),
+            ("Angle (°)", lambda p: p.get('Angle_deg')),
+            ("Wavelength (nm)", lambda p: p.get('Lambda_nm')),
+            ("Temperature (°C)", lambda p: p.get('Temp_C')),
+            ("Viscosity (mPas)", lambda p: p.get('Visc_mPas')),
+            ("Solvent n", lambda p: p.get('n_solvent')),
+            ("Solvent", lambda p: p.get('Solvent')),
+            ("── Results ──", None),
             ("Peak 1 (nm)", lambda p: p.get('Peak1_nm')),
             ("Mean 1 (nm)", lambda p: p.get('Mean1_nm')),
             ("SD 1 (nm)", lambda p: p.get('SD1_nm')),
@@ -680,8 +756,8 @@ class NSZViewer:
             ("Z-Average (nm)", lambda p: p.get('ZAvg_nm')),
             ("PDI", lambda p: p.get('PDI')),
             ("Span", lambda p: p.get('Span')),
-            ("Mean aritmetico (nm)", lambda p: p.get('AriMean_nm')),
-            ("Mean geometrico (nm)", lambda p: p.get('GeoMean_nm')),
+            ("Arithmetic mean (nm)", lambda p: p.get('AriMean_nm')),
+            ("Geometric mean (nm)", lambda p: p.get('GeoMean_nm')),
         ]
 
         for row_i, (label, fn) in enumerate(ROWS):
@@ -702,7 +778,7 @@ class NSZViewer:
                 self.tree.insert("", tk.END, values=cells, tags=(tag,))
 
 
-    # ── Esportazione ─────────────────────────────────────────────────────────
+    # ── Export ────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _write_xlsx(dest_path, d):
@@ -725,10 +801,10 @@ class NSZViewer:
             cell.alignment = center
             cell.border = border
 
-        # ── Foglio ACF ────────────────────────────────────────────────────────
+        # ── ACF sheet ─────────────────────────────────────────────────────────
         ws_acf = wb.active
         ws_acf.title = 'ACF'
-        headers = ['tau (µs)', 'g₁ exp', 'g₁ fit', 'Residuo']
+        headers = ['tau (µs)', 'g2-1 exp', 'g2-1 fit', 'Residual']
         for ci, h in enumerate(headers, 1):
             style_header(ws_acf.cell(1, ci), h)
         ws_acf.column_dimensions['A'].width = 14
@@ -745,7 +821,7 @@ class NSZViewer:
         for ri, (t, g) in enumerate(zip(tau, acf), 2):
             if t <= 0:
                 continue
-            fi = ri - 2 - off  # indice nel vettore fit/resid
+            fi = ri - 2 - off  # index in the fit/resid vector
             ws_acf.cell(ri, 1, round(float(t), 4)).font = cell_font
             ws_acf.cell(ri, 2, round(float(g), 6)).font = cell_font
             if 0 <= fi < n_fit:
@@ -753,9 +829,9 @@ class NSZViewer:
             if 0 <= fi < n_res:
                 ws_acf.cell(ri, 4, round(float(resid[fi]), 6)).font = cell_font
 
-        # ── Foglio Distribuzione in intensità ────────────────────────────────
-        ws_sz = wb.create_sheet('Distribuzione intensità')
-        for ci, h in enumerate(['Diametro (nm)', 'Intensità (%)', 'Cumulativa (%)'], 1):
+        # ── Intensity distribution sheet ──────────────────────────────────────
+        ws_sz = wb.create_sheet('Intensity distribution')
+        for ci, h in enumerate(['Diameter (nm)', 'Intensity (%)', 'Cumulative (%)'], 1):
             style_header(ws_sz.cell(1, ci), h)
         for col in ('A','B','C'):
             ws_sz.column_dimensions[col].width = 16
@@ -765,10 +841,10 @@ class NSZViewer:
             ws_sz.cell(ri, 2, round(float(iv), 4)).font = cell_font
             ws_sz.cell(ri, 3, round(float(cv), 4)).font = cell_font
 
-        # ── Foglio Distribuzione per numero (Rayleigh: N ∝ I/d⁶) ─────────────
+        # ── Number distribution sheet (Rayleigh: N ∝ I/d⁶) ────────────────────
         num_freq, num_cumul = NSZViewer._to_number_dist(d['sz'], d['intens'])
-        ws_nb = wb.create_sheet('Distribuzione numero')
-        for ci, h in enumerate(['Diametro (nm)', 'Numero (%)', 'Cumulativa (%)'], 1):
+        ws_nb = wb.create_sheet('Number distribution')
+        for ci, h in enumerate(['Diameter (nm)', 'Number (%)', 'Cumulative (%)'], 1):
             style_header(ws_nb.cell(1, ci), h)
         for col in ('A','B','C'):
             ws_nb.column_dimensions[col].width = 16
@@ -778,25 +854,25 @@ class NSZViewer:
             ws_nb.cell(ri, 2, round(float(nv), 4)).font = cell_font
             ws_nb.cell(ri, 3, round(float(cv), 4)).font = cell_font
 
-        # ── Foglio Parametri ──────────────────────────────────────────────────
-        ws_p = wb.create_sheet('Parametri')
-        style_header(ws_p.cell(1, 1), 'Parametro')
-        style_header(ws_p.cell(1, 2), 'Valore')
+        # ── Parameters sheet ──────────────────────────────────────────────────
+        ws_p = wb.create_sheet('Parameters')
+        style_header(ws_p.cell(1, 1), 'Parameter')
+        style_header(ws_p.cell(1, 2), 'Value')
         ws_p.column_dimensions['A'].width = 26
         ws_p.column_dimensions['B'].width = 22
 
         SECTIONS = {
-            'Sample_Name': ('── Campione ──', True),
-            'Angle_deg':   ('── Acquisizione ──', True),
-            'Peak1_nm':    ('── Risultati ──', True),
+            'Sample_Name': ('── Sample ──', True),
+            'Angle_deg':   ('── Acquisition ──', True),
+            'Peak1_nm':    ('── Results ──', True),
         }
         LABELS = {
-            'Sample_Name': 'Nome campione',
-            'Date': 'Data',  'Time': 'Ora',
-            'Solvent': 'Solvente', 'Software': 'Software',
-            'Angle_deg': 'Angolo (°)', 'Lambda_nm': 'Lunghezza d\'onda (nm)',
-            'Temp_C': 'Temperatura (°C)', 'Visc_mPas': 'Viscosità (mPa·s)',
-            'n_solvent': 'n solvente',
+            'Sample_Name': 'Sample name',
+            'Date': 'Date',  'Time': 'Time',
+            'Solvent': 'Solvent', 'Software': 'Software',
+            'Angle_deg': 'Angle (°)', 'Lambda_nm': 'Wavelength (nm)',
+            'Temp_C': 'Temperature (°C)', 'Visc_mPas': 'Viscosity (mPa·s)',
+            'n_solvent': 'Solvent n',
             'Peak1_nm': 'Peak 1 (nm)', 'Mean1_nm': 'Mean 1 (nm)',
             'SD1_nm': 'SD 1 (nm)', 'Area1_pct': 'Area 1 (%)',
             'Peak2_nm': 'Peak 2 (nm)', 'Mean2_nm': 'Mean 2 (nm)',
@@ -804,8 +880,8 @@ class NSZViewer:
             'D10_nm': 'D10 (nm)', 'D50_nm': 'D50 (nm)', 'D90_nm': 'D90 (nm)',
             'Mode_nm': 'Mode (nm)', 'Median_nm': 'Median (nm)',
             'ZAvg_nm': 'Z-Average (nm)', 'PDI': 'PDI',
-            'Span': 'Span', 'GeoMean_nm': 'Mean geometrico (nm)',
-            'AriMean_nm': 'Mean aritmetico (nm)',
+            'Span': 'Span', 'GeoMean_nm': 'Geometric mean (nm)',
+            'AriMean_nm': 'Arithmetic mean (nm)',
         }
 
         ri = 2
@@ -828,24 +904,24 @@ class NSZViewer:
 
     def _export_xlsx(self):
         if not self.selected:
-            messagebox.showinfo("Esporta", "Nessun campione selezionato.")
+            messagebox.showinfo("Export", "No sample selected.")
             return
         if not XLSX_AVAILABLE:
-            messagebox.showerror("Errore", "Libreria openpyxl non disponibile.\nInstallala con: pip install openpyxl")
+            messagebox.showerror("Error", "The openpyxl library is not available.\nInstall it with: pip install openpyxl")
             return
 
         if len(self.selected) == 1:
             d = self.samples[self.selected[0]]
             dest = filedialog.asksaveasfilename(
-                title="Salva come...",
+                title="Save as...",
                 initialfile=f'{d["name"]}.xlsx',
                 defaultextension='.xlsx',
                 filetypes=[("Excel", "*.xlsx")])
             if dest:
                 self._write_xlsx(dest, d)
-                messagebox.showinfo("Esportazione completata", f"Salvato:\n{dest}")
+                messagebox.showinfo("Export completed", f"Saved:\n{dest}")
         else:
-            folder = filedialog.askdirectory(title="Cartella di destinazione")
+            folder = filedialog.askdirectory(title="Destination folder")
             if not folder:
                 return
             saved = []
@@ -854,9 +930,113 @@ class NSZViewer:
                 out = os.path.join(folder, f'{d["name"]}.xlsx')
                 self._write_xlsx(out, d)
                 saved.append(os.path.basename(out))
-            messagebox.showinfo("Esportazione completata",
-                                f"Salvati {len(saved)} file in:\n{folder}\n\n" +
+            messagebox.showinfo("Export completed",
+                                f"Saved {len(saved)} files in:\n{folder}\n\n" +
                                 "\n".join(saved))
+
+    # ── Figure (PlotStyleKit) ─────────────────────────────────────────────────
+
+    def _current_figure(self):
+        """The figure of the active plot tab, or None on the Parameters tab or with nothing selected."""
+        if not self.selected:
+            return None
+        tab = self.notebook.select()
+        if tab == str(self.tab_acf):
+            return self.fig_acf
+        if tab == str(self.tab_size):
+            return self.fig_size
+        return None
+
+    def _copy_figure(self, fig):
+        """Copy of `fig` for saving/editor, restyled Origin: 'single' (4:3) for one panel, 'double' (16:9) for two."""
+        copy = pickle.loads(pickle.dumps(fig))
+        if origin_style is not None and copy.axes:
+            preset = 'single' if len(copy.axes) == 1 else 'double'
+            for ax in copy.axes[:-1]:
+                origin_style.applica_stile_origin(ax, None, set_size=False)
+            origin_style.applica_stile_origin(copy.axes[-1], copy, set_size=True, preset=preset)
+        return copy
+
+    def _figure_or_warn(self, title):
+        fig = self._current_figure()
+        if fig is None:
+            messagebox.showwarning(title, "Select samples and open the Autocorrelogram or Distribution tab.")
+        return fig
+
+    def save_figure_image(self):
+        fig = self._figure_or_warn("Save Figure Image")
+        if fig is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Figure Image", defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg"), ("All Files", "*.*")])
+        if not path:
+            return
+        try:
+            self._copy_figure(fig).savefig(path, dpi=300)
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("Save Figure Image", f"Save failed:\n{e}")
+            return
+        messagebox.showinfo("Save Figure Image", f"Figure saved:\n{path}")
+
+    def save_figure_pickle(self):
+        """Save the figure as a matplotlib pickle: reopenable with plot_editor.pyw as a live Figure object."""
+        fig = self._figure_or_warn("Save Figure")
+        if fig is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Figure", defaultextension=".fig.pickle",
+            filetypes=[("Matplotlib Figure (pickle)", "*.pickle *.pkl"), ("All Files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, 'wb') as f:
+                pickle.dump(self._copy_figure(fig), f)
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("Save Figure", f"Save failed:\n{e}")
+            return
+        messagebox.showinfo("Save Figure", f"Figure saved:\n{path}")
+
+    def _load_plot_editor(self):
+        """Import plot_editor (only once): first a local copy, then the sibling repo PlotStyleKit."""
+        if self._pe_module is None:
+            import importlib.util
+            here = os.path.dirname(os.path.abspath(__file__))
+            candidates = [os.path.join(here, 'plot_editor.pyw'),
+                          os.path.join(here, '..', 'PlotStyleKit', 'plot_editor.pyw')]
+            path = next((c for c in candidates if os.path.isfile(c)), None)
+            if path is None:
+                raise FileNotFoundError(
+                    "plot_editor.pyw not found (PlotStyleKit repo missing next to this project)")
+            spec = importlib.util.spec_from_file_location('plot_editor', path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self._pe_module = mod
+        return self._pe_module
+
+    def open_figure_editor(self):
+        """Open the PlotStyleKit Plot Editor on a copy of the current figure."""
+        fig = self._figure_or_warn("Edit Figure")
+        if fig is None:
+            return
+        try:
+            pe = self._load_plot_editor()
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("Edit Figure", f"plot_editor.pyw not available:\n{e}")
+            return
+        try:
+            copy = self._copy_figure(fig)
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("Edit Figure", f"Cannot duplicate the figure:\n{e}")
+            return
+        top = tk.Toplevel(self.root)
+        top.geometry("1300x820")
+        editor = pe.PlotEditor(top)
+        editor.carica_figura(copy, title="current figure")
 
     # ── Utility ───────────────────────────────────────────────────────────────
 
@@ -875,16 +1055,16 @@ def main():
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
-        print("Nota: tkinterdnd2 non disponibile, drag & drop disabilitato.")
+        print("Note: tkinterdnd2 not available, drag & drop disabled.")
 
     app = NSZViewer(root)
 
     if not OLEFILE_AVAILABLE:
-        messagebox.showwarning("Dipendenza mancante",
-                               "Libreria olefile non disponibile: non sarà possibile aprire i file .nsz.\n"
-                               "Installala con: pip install olefile")
+        messagebox.showwarning("Missing dependency",
+                               "The olefile library is not available: .nsz files cannot be opened.\n"
+                               "Install it with: pip install olefile")
 
-    # Se passati argomenti dalla riga di comando, carica quei file
+    # If files are passed on the command line, load them
     if len(sys.argv) > 1:
         files = [a for a in sys.argv[1:] if a.lower().endswith('.nsz')]
         if files:
